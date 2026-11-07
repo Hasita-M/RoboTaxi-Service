@@ -7,7 +7,7 @@ function [desiredSpeed, state, reasonCode, target] = arrivalPlanner(t, pose, spe
 %     pose          [x y heading] in metres and radians (from localization)
 %     speed         measured speed (m/s)
 %     stopSignDist  distance to the stop sign (m), Inf if none is seen
-%     blueSignRel   [forward left] position of the accessibility sign relative
+%     blueSignRel   [forward left] position of an accessibility sign relative
 %                   to the car (m), [NaN NaN] if none is seen   (from findBlueSign)
 %     rampRel       [forward left] position of a curb ramp relative to the car (m),
 %                   [NaN NaN] if none is seen                  (from findRamp)
@@ -37,20 +37,22 @@ APPROACH_MARGIN = 0.30;   % extra distance to start braking early (m)
 
 % Trip stops in order: [x  y  type  waitSeconds  zoneRadius]
 %   type 1 = pick-up at an exact point
-%   type 2 = accessible drop-off: "park in this region", the car finds the
-%            nearest accessibility sign and the ramp beside it inside the zone
+%   type 2 = drop-off zone. Inside the zone the car picks, in this order:
+%            1) a curb ramp, 2) an accessibility sign, 3) the normal spot (x, y)
 % Replace with real coordinates from the coordinate helper.
-STOPS = [1.5  0.0  1  4.0  0.0;
-         1.0  2.0  2  5.0  0.8];
+STOPS = [1.5  0.0  1  4.0  0.0;    % passenger 1: pick-up at house 1
+         2.5  3.0  2  5.0  0.8;    % passenger 1: drop-off zone A
+         0.0  1.5  1  4.0  0.0;    % passenger 2: pick-up at house 2
+         2.8  0.0  2  5.0  0.8];   % passenger 2: drop-off zone B
 
-RAMP_NEAR_SIGN = 0.60;  % a ramp must be this close to the chosen sign (m)
-DOOR_OFFSET    = 0.00;  % door position ahead of the car's centre (m)
+ZONE_MARGIN = 0.30;     % a sign or ramp may sit this far outside the zone edge (m)
+DOOR_OFFSET = 0.00;     % door position ahead of the car's centre (m)
 
 SIGN_RANGE    = 1.5;    % only react to stop signs closer than this (m)
 SIGN_GAP      = 0.20;   % stop this far before the sign (m)
 SIGN_WAIT     = 3.0;    % full stop time at a stop sign (s)
 SIGN_COOLDOWN = 4.0;    % ignore stop signs for this long after leaving one (s)
-SIGN_MAP_XY   = [3.0 1.6];  % where the map says the stop line is
+SIGN_MAP_XY   = [4.0 2.0];  % where the map says the stop line is
 SKEPTIC_RADIUS = 0.8;   % "a sign should be here" zone around SIGN_MAP_XY (m)
 
 OBS_RANGE  = 1.5;       % react to obstacles closer than this (m)
@@ -69,12 +71,11 @@ R_RAMP_FOUND = 17; R_NO_RAMP = 18;
 
 %% ---------------- Memory between calls ----------------
 persistent st tEnter idx targetType targetXY cooldownUntil obsSince blueSeen
-persistent zoneXY signXY signScore rampLocked rampXY dZoneMin
+persistent zoneXY signXY signScore rampLocked
 if isempty(st)
     st = S_CRUISE;  tEnter = t;  idx = 1;  targetType = 0;
     targetXY = [0 0];  cooldownUntil = -Inf;  obsSince = -1;  blueSeen = false;
-    zoneXY = [0 0];  signXY = [NaN NaN];  signScore = Inf;
-    rampLocked = false;  rampXY = [NaN NaN];  dZoneMin = Inf;
+    zoneXY = [0 0];  signXY = [NaN NaN];  signScore = Inf;  rampLocked = false;
 end
 
 nStops = size(STOPS, 1);
@@ -112,8 +113,7 @@ switch st
                     st = S_SEARCH;  tEnter = t;  targetType = 2;
                     zoneXY = [STOPS(idx,1) STOPS(idx,2)];
                     targetXY = zoneXY;
-                    signXY = [NaN NaN];  signScore = Inf;
-                    rampLocked = false;  rampXY = [NaN NaN];  dZoneMin = Inf;
+                    signXY = [NaN NaN];  signScore = Inf;  rampLocked = false;
                 end
             elseif dTrip <= startBrakingAt
                 st = S_APPROACH;  tEnter = t;
@@ -139,49 +139,49 @@ switch st
         end
 
     case S_SEARCH
-        % Drive slowly through the drop-off zone looking for the accessible spot.
-        dZone = hypot(pose(1) - zoneXY(1), pose(2) - zoneXY(2));
-        dZoneMin = min(dZoneMin, dZone);
-        v = min(V_CRUISE, sqrt(V_SEARCH^2 + 2*aBrake*max(dZone - STOPS(idx,5), 0)));
-        reason = R_SEARCHING;
+        % Head for the normal drop-off spot, but switch to a better spot if one
+        % appears in the zone: ramp first, then accessibility sign.
+        R = STOPS(idx,5);
 
-        % 1. Locate accessibility signs on the map; keep the one nearest the zone centre.
-        if signSeenNow
+        % Accessibility sign: keep the one nearest the zone centre.
+        if signSeenNow && ~rampLocked
             p = relToMap(pose, blueSignRel);
             score = hypot(p(1) - zoneXY(1), p(2) - zoneXY(2));
-            if score <= STOPS(idx,5) + RAMP_NEAR_SIGN && score < signScore
+            along = blueSignRel(1) - DOOR_OFFSET;
+            if score <= R + ZONE_MARGIN && score < signScore && along > DOCK_DIST + 0.05
                 signXY = p;  signScore = score;
+                targetXY = [pose(1) + along*c, pose(2) + along*s];   % stop level with the sign
             end
         end
-        if ~isnan(signXY(1))
-            reason = R_SIGN_LOCATED;
-        end
 
-        % 2. Accept a ramp only if it is beside the chosen sign.
-        if rampSeenNow && ~isnan(signXY(1))
+        % Curb ramp in the zone: best option, lock it.
+        if rampSeenNow && ~rampLocked
             p = relToMap(pose, rampRel);
-            if hypot(p(1) - signXY(1), p(2) - signXY(2)) <= RAMP_NEAR_SIGN
-                rampXY = p;  rampLocked = true;
-                % Stop with the door level with the ramp: keep only the
-                % along-the-road part of the ramp's position.
-                along = rampRel(1) - DOOR_OFFSET;
-                targetXY = [pose(1) + along*c, pose(2) + along*s];
-                st = S_APPROACH;  tEnter = t;  reason = R_RAMP_FOUND;
+            along = rampRel(1) - DOOR_OFFSET;
+            if hypot(p(1) - zoneXY(1), p(2) - zoneXY(2)) <= R + ZONE_MARGIN && along > DOCK_DIST + 0.05
+                rampLocked = true;
+                targetXY = [pose(1) + along*c, pose(2) + along*s];   % door level with the ramp
             end
         end
 
-        % 3. Fallback: we have passed the zone centre without finding a ramp.
-        %    (From the centre the camera has already looked across the rest of the zone.)
-        if st == S_SEARCH && dZone > dZoneMin + 0.05
-            if ~isnan(signXY(1))
-                % Stop level with the sign.
-                rel = mapToRel(pose, signXY);
-                along = max(rel(1), DOCK_DIST + 0.05);
-            else
-                along = DOCK_DIST + 0.05;   % stop as soon as gently possible
+        % Speed: ease down to search speed by the zone edge, then the usual
+        % gentle braking curve onto whichever target is current.
+        d = hypot(pose(1) - targetXY(1), pose(2) - targetXY(2));
+        dZone = hypot(pose(1) - zoneXY(1), pose(2) - zoneXY(2));
+        vTop = min(V_CRUISE, sqrt(V_SEARCH^2 + 2*aBrake*max(dZone - R, 0)));
+        v = min(vTop, max(V_CRAWL, sqrt(2*aBrake*max(d - DOCK_DIST, 0))));
+        if rampLocked
+            reason = R_RAMP_FOUND;
+        elseif ~isnan(signXY(1))
+            reason = R_SIGN_LOCATED;
+        else
+            reason = R_SEARCHING;
+        end
+        if d <= DOCK_DIST
+            st = S_DOCK;  tEnter = t;
+            if ~rampLocked && isnan(signXY(1))
+                reason = R_NO_RAMP;
             end
-            targetXY = [pose(1) + along*c, pose(2) + along*s];
-            st = S_APPROACH;  tEnter = t;  reason = R_NO_RAMP;
         end
 
     case S_APPROACH
